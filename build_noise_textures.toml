@@ -1,0 +1,2 @@
+assets_dir = "./assets"
+file_extensions = ["png"]
