@@ -1,0 +1,23 @@
+{
+    "pack": {
+        "pack_format": 68,
+        "supported_formats": {
+            "min_inclusive": 12,
+            "max_inclusive": 68
+        },
+        "description": [
+            {
+                "text": "Loading bar break animation",
+                "color": "yellow"
+            },
+            {
+                "text": "\nCreated By: ",
+                "color": "gold"
+            },
+            {
+                "text": "RandomGgames",
+                "color": "#00ff00"
+            }
+        ]
+    }
+}
