@@ -55,7 +55,7 @@ def scale_texture_image(file_path: typing.Union[pathlib.Path, str], scaler_modif
         image = Image.open(file_path)
         new_width = image.width * scaler_modifier
         new_height = image.height * scaler_modifier
-        image = image.resize((new_width, new_height))
+        image = image.resize((new_width, new_height), resample=Image.NEAREST)
         image.save(file_path)
         logger.debug(f"Scaled media file: {file_path}")
         return (new_width, new_height)
@@ -80,47 +80,40 @@ def generate_noise_pattern(x: int, y: int) -> bytes:
     return bytes(pixels)
 
 
-def preview_noise_pattern(x: int, y: int, seed: typing.Optional[int] = None) -> None:
+def apply_noise(image_path, noise_bytes, output_path, strength=0.075):
     """
-    Generates a noise pattern image with the specified size and displays it.
-    :param x: Width of the image
-    :param y: Height of the image
-    :param seed: Optional seed for the random number generator
-    :return: None
+    Apply square noise to any image. If image is taller than wide, tile noise vertically for frames.
+    :param image_path: Path to image
+    :param noise_bytes: Bytes of square noise texture
+    :param output_path: Path to save result
+    :param strength: Blending strength
     """
-    import matplotlib.pyplot as plt
-    import numpy as np
-    random.seed(seed)
-    noise_pattern = generate_noise_pattern(x, y)
-    image = np.frombuffer(noise_pattern, dtype=np.uint8).reshape((y, x, 3))
-    plt.imshow(image)
-    plt.show()
-
-
-def apply_noise(image_path, noise_bytes, output_path):
-    # Open the image and convert to RGBA
     img = Image.open(image_path).convert("RGBA")
     img_arr = np.array(img).astype(np.float32)
 
     height, width = img_arr.shape[:2]
 
-    # Noise array: reshape to 3 channels, then take just one channel
-    noise_arr = np.frombuffer(noise_bytes, dtype=np.uint8).reshape((height, width, 3))
-    noise_gray = noise_arr[..., 0]  # pick red channel, grayscale is same across channels
-    noise_norm = noise_gray / 255.0
+    # Noise square
+    noise_arr = np.frombuffer(noise_bytes, dtype=np.uint8).reshape((width, width, 3))
+    noise_gray = noise_arr[..., 0] / 255.0  # normalize 0-1
+
+    # Tile noise vertically if image is taller than noise
+    if height > width:
+        num_tiles = height // width
+        noise_full = np.tile(noise_gray, (num_tiles, 1))
+    else:
+        noise_full = noise_gray[:height, :width]
 
     # Split channels
     r, g, b, a = img_arr[..., 0], img_arr[..., 1], img_arr[..., 2], img_arr[..., 3]
 
-    # Mask of non-transparent pixels
     mask = a > 0
 
-    # Apply noise: dark pixels reduce color, white leaves it unchanged
-    r[mask] *= noise_norm[mask]
-    g[mask] *= noise_norm[mask]
-    b[mask] *= noise_norm[mask]
+    # Blend noise
+    r[mask] = r[mask] * (1 - strength) + r[mask] * noise_full[mask] * strength
+    g[mask] = g[mask] * (1 - strength) + g[mask] * noise_full[mask] * strength
+    b[mask] = b[mask] * (1 - strength) + b[mask] * noise_full[mask] * strength
 
-    # Recombine channels and save
     result_arr = np.stack([r, g, b, a], axis=-1).astype(np.uint8)
     Image.fromarray(result_arr, "RGBA").save(output_path)
 
