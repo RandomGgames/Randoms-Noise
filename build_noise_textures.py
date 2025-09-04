@@ -5,6 +5,7 @@ import time
 import toml
 import traceback
 import typing
+import random
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -34,8 +35,8 @@ def load_config(config_path: str = "config.toml") -> dict:
     return config
 
 
-def get_texture_file_paths(config: dict) -> typing.Iterable[pathlib.Path]:
-    assets_dir = pathlib.Path(config["assets_dir"]).resolve()
+def iterate_through_texture_file_paths(config: dict) -> typing.Iterable[pathlib.Path]:
+    assets_dir = pathlib.Path(config["assets_dir"])
     logger.debug(f"Searching for media files in '{assets_dir}'...")
     for file_path in assets_dir.rglob("*"):
         if file_path.is_file():
@@ -44,13 +45,65 @@ def get_texture_file_paths(config: dict) -> typing.Iterable[pathlib.Path]:
                 yield file_path
 
 
+def scale_texture_image(file_path: typing.Union[pathlib.Path, str], scaler_modifier: int) -> typing.Tuple[int, int] | None:
+    file_path = pathlib.Path(file_path)
+    try:
+        logger.debug(f"Scaling media file: {file_path}")
+        from PIL import Image
+        image = Image.open(file_path)
+        new_width = image.width * scaler_modifier
+        new_height = image.height * scaler_modifier
+        image = image.resize((new_width, new_height))
+        image.save(file_path)
+        logger.debug(f"Scaled media file: {file_path}")
+        return (new_width, new_height)
+    except Exception as e:
+        logger.error(f"An error occured while scaling media file: {file_path}\n{traceback.format_exc()}")
+
+
+def generate_noise_pattern(x: int, y: int) -> bytes:
+    """
+    Generates a noise pattern image with the specified size.
+    :param x: Width of the image
+    :param y: Height of the image
+    :return: A bytes object containing the RGB data of the image
+    """
+    if x <= 0 or y <= 0:
+        raise ValueError("x and y must be positive integers")
+    pixels = bytearray()
+    for row in range(y):
+        for col in range(x):
+            brightness = random.randint(0, 255)
+            pixels.extend([brightness, brightness, brightness])
+    return bytes(pixels)
+
+
+def preview_noise_pattern(x: int, y: int, seed: typing.Optional[int] = None) -> None:
+    """
+    Generates a noise pattern image with the specified size and displays it.
+    :param x: Width of the image
+    :param y: Height of the image
+    :param seed: Optional seed for the random number generator
+    :return: None
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    random.seed(seed)
+    noise_pattern = generate_noise_pattern(x, y)
+    image = np.frombuffer(noise_pattern, dtype=np.uint8).reshape((y, x, 3))
+    plt.imshow(image)
+    plt.show()
+
+
 def main() -> None:
     config_path = "build_noise_textures.toml"
     config = load_config(config_path)
-    texture_file_paths = get_texture_file_paths(config)
-
-    for file_path in texture_file_paths:
-        logger.debug(f"Processing media file: {file_path}")
+    for texture_file in iterate_through_texture_file_paths(config):
+        scale_result = scale_texture_image(texture_file, 4)
+        if scale_result is None:
+            continue
+        width, height = scale_result
+        noise_pattern = generate_noise_pattern(width, height)
 
 
 def setup_logging(
