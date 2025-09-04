@@ -1,12 +1,14 @@
 import logging
 import pathlib
+import random
 import sys
 import time
 import toml
 import traceback
 import typing
-import random
 from datetime import datetime
+from PIL import Image
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +97,34 @@ def preview_noise_pattern(x: int, y: int, seed: typing.Optional[int] = None) -> 
     plt.show()
 
 
+def apply_noise(image_path, noise_bytes, output_path):
+    # Open the image and convert to RGBA
+    img = Image.open(image_path).convert("RGBA")
+    img_arr = np.array(img).astype(np.float32)
+
+    height, width = img_arr.shape[:2]
+
+    # Noise array: reshape to 3 channels, then take just one channel
+    noise_arr = np.frombuffer(noise_bytes, dtype=np.uint8).reshape((height, width, 3))
+    noise_gray = noise_arr[..., 0]  # pick red channel, grayscale is same across channels
+    noise_norm = noise_gray / 255.0
+
+    # Split channels
+    r, g, b, a = img_arr[..., 0], img_arr[..., 1], img_arr[..., 2], img_arr[..., 3]
+
+    # Mask of non-transparent pixels
+    mask = a > 0
+
+    # Apply noise: dark pixels reduce color, white leaves it unchanged
+    r[mask] *= noise_norm[mask]
+    g[mask] *= noise_norm[mask]
+    b[mask] *= noise_norm[mask]
+
+    # Recombine channels and save
+    result_arr = np.stack([r, g, b, a], axis=-1).astype(np.uint8)
+    Image.fromarray(result_arr, "RGBA").save(output_path)
+
+
 def main() -> None:
     config_path = "build_noise_textures.toml"
     config = load_config(config_path)
@@ -104,6 +134,7 @@ def main() -> None:
             continue
         width, height = scale_result
         noise_pattern = generate_noise_pattern(width, height)
+        apply_noise(texture_file, noise_pattern, texture_file)
 
 
 def setup_logging(
