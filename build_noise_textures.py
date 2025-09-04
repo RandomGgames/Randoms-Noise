@@ -63,46 +63,44 @@ def scale_texture_image(file_path: typing.Union[pathlib.Path, str], scaler_modif
         logger.error(f"An error occured while scaling media file: {file_path}\n{traceback.format_exc()}")
 
 
-def generate_noise_pattern(x: int, y: int) -> bytes:
+def generate_noise_pattern(width: int) -> bytes:
     """
-    Generates a noise pattern image with the specified size.
-    :param x: Width of the image
-    :param y: Height of the image
-    :return: A bytes object containing the RGB data of the image
+    Generate a square noise texture of size width x width (RGB).
+    :param width: Width and height of the square noise
+    :return: Bytes containing RGB data
     """
-    if x <= 0 or y <= 0:
-        raise ValueError("x and y must be positive integers")
+    if width <= 0:
+        raise ValueError("width must be positive")
     pixels = bytearray()
-    for row in range(y):
-        for col in range(x):
-            brightness = random.randint(0, 255)
-            pixels.extend([brightness, brightness, brightness])
+    for _ in range(width * width):
+        brightness = random.randint(0, 255)
+        pixels.extend([brightness, brightness, brightness])
     return bytes(pixels)
 
 
 def apply_noise(image_path, noise_bytes, output_path, strength=0.075):
     """
-    Apply square noise to any image. If image is taller than wide, tile noise vertically for frames.
-    :param image_path: Path to image
-    :param noise_bytes: Bytes of square noise texture
-    :param output_path: Path to save result
-    :param strength: Blending strength
+    Apply noise to any image. Treats textures under "textures/block" as vertical strip animations.
     """
-    img = Image.open(image_path).convert("RGBA")
+    logger.debug(f"Applying noise to {image_path}...")
+    img_path = pathlib.Path(image_path)
+    img = Image.open(img_path).convert("RGBA")
     img_arr = np.array(img).astype(np.float32)
-
     height, width = img_arr.shape[:2]
 
-    # Noise square
+    # Noise square (width x width)
     noise_arr = np.frombuffer(noise_bytes, dtype=np.uint8).reshape((width, width, 3))
-    noise_gray = noise_arr[..., 0] / 255.0  # normalize 0-1
+    noise_gray = noise_arr[..., 0] / 255.0
 
-    # Tile noise vertically if image is taller than noise
-    if height > width:
+    # Determine if image is animated (block textures) or single-frame
+    if "textures\\block" in str(img_path) or "textures/block" in str(img_path):
+        # Vertical strip animation: tile noise vertically
         num_tiles = height // width
         noise_full = np.tile(noise_gray, (num_tiles, 1))
     else:
-        noise_full = noise_gray[:height, :width]
+        # Non-animated: just resize noise to match full image
+        noise_img = Image.fromarray((noise_gray * 255).astype(np.uint8), mode="L")
+        noise_full = np.array(noise_img.resize((width, height), resample=Image.NEAREST)) / 255.0
 
     # Split channels
     r, g, b, a = img_arr[..., 0], img_arr[..., 1], img_arr[..., 2], img_arr[..., 3]
@@ -115,7 +113,9 @@ def apply_noise(image_path, noise_bytes, output_path, strength=0.075):
     b[mask] = b[mask] * (1 - strength) + b[mask] * noise_full[mask] * strength
 
     result_arr = np.stack([r, g, b, a], axis=-1).astype(np.uint8)
+    logger.debug(f"Saving noised image to {output_path}...")
     Image.fromarray(result_arr, "RGBA").save(output_path)
+    logger.debug(f"Done applying noise to {image_path}.")
 
 
 def main() -> None:
@@ -124,9 +124,10 @@ def main() -> None:
     for texture_file in iterate_through_texture_file_paths(config):
         scale_result = scale_texture_image(texture_file, 4)
         if scale_result is None:
+            logger.warning(f"Failed to scale media file: {texture_file}")
             continue
         width, height = scale_result
-        noise_pattern = generate_noise_pattern(width, height)
+        noise_pattern = generate_noise_pattern(width)
         apply_noise(texture_file, noise_pattern, texture_file)
 
 
