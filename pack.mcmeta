@@ -1,13 +1,14 @@
 {
     "pack": {
-        "pack_format": 68,
-        "supported_formats": {
-            "min_inclusive": 12,
-            "max_inclusive": 68
-        },
+        "min_format": [
+            84
+        ],
+        "max_format": [
+            84
+        ],
         "description": [
             {
-                "text": "Loading bar break animation",
+                "text": "A little noise is nice!",
                 "color": "yellow"
             },
             {
