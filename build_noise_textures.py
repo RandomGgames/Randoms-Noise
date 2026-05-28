@@ -37,7 +37,7 @@ logger.setLevel(logging.DEBUG)
 
 @dataclass
 class ScriptSettings:
-    assets_dir: Path = Path(r"assets\minecraft\textures")
+    assets_dir: Path = Path(r"assets")
     scaler_modifier: int = 4
     strength: float = 0.075
     supported_extensions: list[str] = field(default_factory=lambda: [".png"])
@@ -478,7 +478,7 @@ class LogSettings:
     date_format: str = "%Y-%m-%dT%H:%M:%S"
     message_format: str = "%(asctime)s.%(msecs)03d [%(levelname)-8s] %(message)s"
     # message_format: str = "%(asctime)s.%(msecs)03d [%(levelname)-8s] %(module)s:%(funcName)s - %(message)s"
-    max_files: int | None = 30
+    max_files: int | None = 8
     open_log_after_run: bool = False
 
 
@@ -499,19 +499,21 @@ def get_deterministic_rng(seed_string: str) -> random.Random:
     """
     Creates a deterministic Random instance based on a string (e.g., filename).
     """
+    logger.debug("Generating rng...")
     hash_digest = hashlib.md5(seed_string.encode("utf-8")).hexdigest()
+    logger.debug("Done")
     return random.Random(int(hash_digest, 16))
 
 
 def scale_texture_image(file_path: Path, scaler_modifier: int) -> tuple[int, int] | None:
+    logger.debug("Scaling x%s...", scaler_modifier)
     try:
-        logger.debug("Scaling media file: %s", file_path)
         with Image.open(file_path) as image:
             new_width = image.width * scaler_modifier
             new_height = image.height * scaler_modifier
             resized_image = image.resize((new_width, new_height), resample=Image.Resampling.NEAREST)
             resized_image.save(file_path)
-        logger.debug("Scaled media file: %s", file_path)
+            logger.debug("Scaled from %sx%s to %sx%s", image.width, image.height, new_width, new_height)
         return new_width, new_height
     except Exception as e:
         logger.error("An error occurred while scaling media file %s: %s", file_path, e)
@@ -521,41 +523,64 @@ def scale_texture_image(file_path: Path, scaler_modifier: int) -> tuple[int, int
 def generate_noise_pattern(width: int, rng: random.Random) -> bytes:
     """
     Generate a square noise texture of size width x width (RGB) using a local RNG.
+    Optimized via NumPy to eliminate pure Python loops on high-resolution textures.
     """
+    logger.debug("Generating noise pattern...")
     if width <= 0:
         raise ValueError("width must be positive")
 
-    pixels = bytearray()
-    for _ in range(width * width):
-        brightness = rng.randint(0, 255)
-        pixels.extend([brightness, brightness, brightness])
-    return bytes(pixels)
+    # Pull a 32-bit integer seed from the localized RNG state to stay deterministic
+    np_seed = rng.randint(0, 2**32 - 1)
+
+    # Create an isolated NumPy Generator instance so we don't pollute global numpy state
+    np_rng = np.random.default_rng(np_seed)
+
+    # Generate the grayscale byte sequence directly (3 channels per pixel)
+    # 1. Generate width * width brightness values
+    brightness = np_rng.integers(0, 256, size=width * width, dtype=np.uint8)
+
+    # 2. Repeat each brightness value 3 times for RGB alignment, then convert to raw bytes
+    # np.repeat is extremely fast and handles the exact layout expected by your frombuffer calls
+    noise_bytes = np.repeat(brightness, 3).tobytes()
+
+    logger.debug("Done")
+    return noise_bytes
 
 
 def apply_noise_array(image_path: Path, noise_full: np.ndarray, strength: float) -> None:
     """
     Blends a pre-calculated/tiled noise array onto the target image.
     """
-    logger.debug("Applying noise to %s", image_path)
+    logger.debug("Applying noise array...")
     try:
         with Image.open(image_path) as img:
             img_rgba = img.convert("RGBA")
 
         img_arr = np.array(img_rgba).astype(np.float32)
-        r, g, b, a = img_arr[..., 0], img_arr[..., 1], img_arr[..., 2], img_arr[..., 3]
 
+        if img_arr.size == 0 or img_arr.shape[0] == 0 or img_arr.shape[1] == 0:
+            logger.warning("Skipping noise application: Image %s has empty dimensions.", image_path)
+            return
+
+        if noise_full.shape != img_arr.shape[:2]:
+            logger.warning(
+                "Skipping noise application: Noise map shape %s does not match image shape %s for %s",
+                noise_full.shape, img_arr.shape[:2], image_path
+            )
+            return
+
+        r, g, b, a = img_arr[..., 0], img_arr[..., 1], img_arr[..., 2], img_arr[..., 3]
         mask = a > 0
 
-        # Blend noise using the provided full-size noise map and script strength setting
         r[mask] = r[mask] * (1 - strength) + r[mask] * noise_full[mask] * strength
         g[mask] = g[mask] * (1 - strength) + g[mask] * noise_full[mask] * strength
         b[mask] = b[mask] * (1 - strength) + b[mask] * noise_full[mask] * strength
 
         result_arr = np.stack([r, g, b, a], axis=-1).astype(np.uint8)
+        logger.debug("Applied.")
 
-        logger.debug("Saving noised image to %s", image_path)
         Image.fromarray(result_arr, "RGBA").save(image_path)
-        logger.debug("Done applying noise to %s", image_path)
+        logger.debug("Saved to file.")
     except Exception as e:
         logger.error("Failed to apply noise to %s: %s", image_path, e)
 
@@ -569,17 +594,27 @@ def process_single_image_noise(
     columns: int = 1,
 ) -> None:
     """
-    Generates and maps the correct noise layout for a single texture file
-    (handles both static textures and vanilla vertical/grid spritesheets).
+    Generates and maps the correct noise layout for a single texture file.
+    Handles static textures, vertical sheets, and multi-column layouts safely.
     """
     frame_width = width // columns
+    if frame_width == 0:
+        frame_width = 1
 
     noise_bytes = generate_noise_pattern(frame_width, rng)
     noise_arr = np.frombuffer(noise_bytes, dtype=np.uint8).reshape((frame_width, frame_width, 3))
     noise_gray = noise_arr[..., 0] / 255.0
 
+    # Calculate rows required, ensuring it builds at least a 1x1 block framework
     rows = height // frame_width
+    if rows == 0:
+        rows = 1
+
+    # Tile to cover the potential frame bounds
     noise_full = np.tile(noise_gray, (rows, columns))
+
+    # Crop the tiled matrix down to match the precise image dimensions
+    noise_full = noise_full[:height, :width]
 
     apply_noise_array(file_path, noise_full, strength)
 
@@ -597,7 +632,6 @@ def main(config: Config):
 
     logger.info("Scanning for textures in %s", assets_dir)
 
-    # Convert settings extensions to a lowercase set for cleaner O(1) matching
     valid_exts = {ext.lower() for ext in settings.supported_extensions}
 
     # 1. Map lookups for quick identification of handled animations
@@ -636,6 +670,8 @@ def main(config: Config):
         if rel_path in processed_files:
             continue
 
+        logger.debug("Processing %s", file_path)
+
         # Scenario A: Vanilla Spritesheet
         if rel_path in spritesheet_map:
             columns = spritesheet_map[rel_path]
@@ -655,7 +691,6 @@ def main(config: Config):
 
             if scale_res:
                 w, h = scale_res
-                # Upscale remaining siblings using runtime setting configuration
                 for sibling_rel in all_set_rel_paths[1:]:
                     scale_texture_image(assets_dir / sibling_rel, settings.scaler_modifier)
 
@@ -664,7 +699,15 @@ def main(config: Config):
                 noise_arr = np.frombuffer(noise_bytes, dtype=np.uint8).reshape((w, w, 3))
                 noise_gray = noise_arr[..., 0] / 255.0
 
-                noise_full = np.tile(noise_gray, (h // w, 1)) if h != w else noise_gray
+                # Handle non-square master layouts cleanly
+                if h != w:
+                    req_rows = h // w
+                    if req_rows == 0:
+                        req_rows = 1
+                    noise_full = np.tile(noise_gray, (req_rows, 1))
+                    noise_full = noise_full[:h, :w]
+                else:
+                    noise_full = noise_gray
 
                 for sibling_rel in all_set_rel_paths:
                     apply_noise_array(assets_dir / sibling_rel, noise_full, settings.strength)
@@ -688,7 +731,15 @@ def main(config: Config):
                 noise_bytes = generate_noise_pattern(w, rng)
                 noise_arr = np.frombuffer(noise_bytes, dtype=np.uint8).reshape((w, w, 3))
                 noise_gray = noise_arr[..., 0] / 255.0
-                noise_full = np.tile(noise_gray, (h // w, 1)) if h != w else noise_gray
+
+                if h != w:
+                    req_rows = h // w
+                    if req_rows == 0:
+                        req_rows = 1
+                    noise_full = np.tile(noise_gray, (req_rows, 1))
+                    noise_full = noise_full[:h, :w]
+                else:
+                    noise_full = noise_gray
 
                 for sibling_rel in all_set_rel_paths:
                     apply_noise_array(assets_dir / sibling_rel, noise_full, settings.strength)
@@ -711,8 +762,6 @@ def main(config: Config):
             process_single_image_noise(file_path, rng, w, h, settings.strength, columns=1)
 
         processed_files.add(rel_path)
-
-    logger.info("Texture scaling and noise generation pass complete.")
 
 
 def enforce_max_log_count(dir_path: Path, max_count: int, script_name: str) -> None:
