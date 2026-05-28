@@ -5,10 +5,13 @@ This script is designed to add noise to Minecraft textures.
 It scales up all images by x4 and adds a noise pattern to the textures.
 """
 
+import hashlib
 import json
 import logging
 import logging.handlers
+import numpy as np
 import os
+import random
 import socket
 import sys
 import typing
@@ -16,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +38,10 @@ logger.setLevel(logging.DEBUG)
 @dataclass
 class ScriptSettings:
     assets_dir: Path = Path(r"assets\minecraft\textures")
-    noise_seed: int = 25259871341
-    animated_textures: list[dict] = [
+    scaler_modifier: int = 4
+    strength: float = 0.075
+    supported_extensions: list[str] = field(default_factory=lambda: [".png"])
+    animated_textures: list[dict] = field(default_factory=lambda: [
         {
             "type": "vanilla_spritesheet",
             "path": Path(r"block\blast_furnace_front_on.png"),
@@ -460,7 +466,7 @@ class ScriptSettings:
                 Path(r"item\recovery_compass_31.png"),
             ]
         },
-    ]
+    ])
 
 
 @dataclass
@@ -489,8 +495,224 @@ class Config:
     runtime_settings: RuntimeSettings = field(default_factory=RuntimeSettings)
 
 
+def get_deterministic_rng(seed_string: str) -> random.Random:
+    """
+    Creates a deterministic Random instance based on a string (e.g., filename).
+    """
+    hash_digest = hashlib.md5(seed_string.encode("utf-8")).hexdigest()
+    return random.Random(int(hash_digest, 16))
+
+
+def scale_texture_image(file_path: Path, scaler_modifier: int) -> tuple[int, int] | None:
+    try:
+        logger.debug("Scaling media file: %s", file_path)
+        with Image.open(file_path) as image:
+            new_width = image.width * scaler_modifier
+            new_height = image.height * scaler_modifier
+            resized_image = image.resize((new_width, new_height), resample=Image.Resampling.NEAREST)
+            resized_image.save(file_path)
+        logger.debug("Scaled media file: %s", file_path)
+        return new_width, new_height
+    except Exception as e:
+        logger.error("An error occurred while scaling media file %s: %s", file_path, e)
+        return None
+
+
+def generate_noise_pattern(width: int, rng: random.Random) -> bytes:
+    """
+    Generate a square noise texture of size width x width (RGB) using a local RNG.
+    """
+    if width <= 0:
+        raise ValueError("width must be positive")
+
+    pixels = bytearray()
+    for _ in range(width * width):
+        brightness = rng.randint(0, 255)
+        pixels.extend([brightness, brightness, brightness])
+    return bytes(pixels)
+
+
+def apply_noise_array(image_path: Path, noise_full: np.ndarray, strength: float) -> None:
+    """
+    Blends a pre-calculated/tiled noise array onto the target image.
+    """
+    logger.debug("Applying noise to %s", image_path)
+    try:
+        with Image.open(image_path) as img:
+            img_rgba = img.convert("RGBA")
+
+        img_arr = np.array(img_rgba).astype(np.float32)
+        r, g, b, a = img_arr[..., 0], img_arr[..., 1], img_arr[..., 2], img_arr[..., 3]
+
+        mask = a > 0
+
+        # Blend noise using the provided full-size noise map and script strength setting
+        r[mask] = r[mask] * (1 - strength) + r[mask] * noise_full[mask] * strength
+        g[mask] = g[mask] * (1 - strength) + g[mask] * noise_full[mask] * strength
+        b[mask] = b[mask] * (1 - strength) + b[mask] * noise_full[mask] * strength
+
+        result_arr = np.stack([r, g, b, a], axis=-1).astype(np.uint8)
+
+        logger.debug("Saving noised image to %s", image_path)
+        Image.fromarray(result_arr, "RGBA").save(image_path)
+        logger.debug("Done applying noise to %s", image_path)
+    except Exception as e:
+        logger.error("Failed to apply noise to %s: %s", image_path, e)
+
+
+def process_single_image_noise(
+    file_path: Path,
+    rng: random.Random,
+    width: int,
+    height: int,
+    strength: float,
+    columns: int = 1,
+) -> None:
+    """
+    Generates and maps the correct noise layout for a single texture file
+    (handles both static textures and vanilla vertical/grid spritesheets).
+    """
+    frame_width = width // columns
+
+    noise_bytes = generate_noise_pattern(frame_width, rng)
+    noise_arr = np.frombuffer(noise_bytes, dtype=np.uint8).reshape((frame_width, frame_width, 3))
+    noise_gray = noise_arr[..., 0] / 255.0
+
+    rows = height // frame_width
+    noise_full = np.tile(noise_gray, (rows, columns))
+
+    apply_noise_array(file_path, noise_full, strength)
+
+
 def main(config: Config):
-    """Code goes here"""
+    """
+    Processes all Minecraft textures by upscaling them and applying deterministic noise loops.
+    """
+    settings = config.script_settings
+    assets_dir = settings.assets_dir
+
+    if not assets_dir.exists():
+        logger.error("Assets directory does not exist: %s", assets_dir)
+        return
+
+    logger.info("Scanning for textures in %s", assets_dir)
+
+    # Convert settings extensions to a lowercase set for cleaner O(1) matching
+    valid_exts = {ext.lower() for ext in settings.supported_extensions}
+
+    # 1. Map lookups for quick identification of handled animations
+    spritesheet_map = {}
+    imageset_first_files = {}
+    imageset_siblings = {}
+
+    for anim in settings.animated_textures:
+        anim_type = anim.get("type")
+
+        if anim_type == "vanilla_spritesheet":
+            spritesheet_map[Path(anim["path"])] = anim.get("columns", 1)
+
+        elif anim_type == "image_set" and anim.get("paths"):
+            paths = [Path(p) for p in anim["paths"]]
+            first_path = paths[0]
+            imageset_first_files[first_path] = paths
+            for path in paths:
+                imageset_siblings[path] = first_path
+
+    # 2. Gather all valid asset paths relative to the assets folder root
+    all_files = [
+        f for f in assets_dir.rglob("*")
+        if f.is_file() and f.suffix.lower() in valid_exts
+    ]
+
+    processed_files = set()
+
+    # 3. First pass: Handle explicitly configured animations to prevent double processing
+    for file_path in all_files:
+        try:
+            rel_path = file_path.relative_to(assets_dir)
+        except ValueError:
+            continue
+
+        if rel_path in processed_files:
+            continue
+
+        # Scenario A: Vanilla Spritesheet
+        if rel_path in spritesheet_map:
+            columns = spritesheet_map[rel_path]
+            scale_res = scale_texture_image(file_path, settings.scaler_modifier)
+            if scale_res:
+                w, h = scale_res
+                rng = get_deterministic_rng(rel_path.as_posix())
+                process_single_image_noise(file_path, rng, w, h, settings.strength, columns)
+            processed_files.add(rel_path)
+
+        # Scenario B: Image Set (Triggered when encountering the first file of the collection)
+        elif rel_path in imageset_first_files:
+            all_set_rel_paths = imageset_first_files[rel_path]
+
+            first_absolute_path = assets_dir / rel_path
+            scale_res = scale_texture_image(first_absolute_path, settings.scaler_modifier)
+
+            if scale_res:
+                w, h = scale_res
+                # Upscale remaining siblings using runtime setting configuration
+                for sibling_rel in all_set_rel_paths[1:]:
+                    scale_texture_image(assets_dir / sibling_rel, settings.scaler_modifier)
+
+                rng = get_deterministic_rng(rel_path.as_posix())
+                noise_bytes = generate_noise_pattern(w, rng)
+                noise_arr = np.frombuffer(noise_bytes, dtype=np.uint8).reshape((w, w, 3))
+                noise_gray = noise_arr[..., 0] / 255.0
+
+                noise_full = np.tile(noise_gray, (h // w, 1)) if h != w else noise_gray
+
+                for sibling_rel in all_set_rel_paths:
+                    apply_noise_array(assets_dir / sibling_rel, noise_full, settings.strength)
+                    processed_files.add(sibling_rel)
+
+        # Scenario C: A sibling file belonging to an image set whose master wasn't hit first
+        elif rel_path in imageset_siblings:
+            master_rel = imageset_siblings[rel_path]
+            if master_rel in processed_files:
+                continue
+
+            all_set_rel_paths = imageset_first_files[master_rel]
+            scale_res = scale_texture_image(assets_dir / master_rel, settings.scaler_modifier)
+            if scale_res:
+                w, h = scale_res
+                for sibling_rel in all_set_rel_paths:
+                    if sibling_rel != master_rel:
+                        scale_texture_image(assets_dir / sibling_rel, settings.scaler_modifier)
+
+                rng = get_deterministic_rng(master_rel.as_posix())
+                noise_bytes = generate_noise_pattern(w, rng)
+                noise_arr = np.frombuffer(noise_bytes, dtype=np.uint8).reshape((w, w, 3))
+                noise_gray = noise_arr[..., 0] / 255.0
+                noise_full = np.tile(noise_gray, (h // w, 1)) if h != w else noise_gray
+
+                for sibling_rel in all_set_rel_paths:
+                    apply_noise_array(assets_dir / sibling_rel, noise_full, settings.strength)
+                    processed_files.add(sibling_rel)
+
+    # 4. Second pass: Process remaining unhandled static images
+    for file_path in all_files:
+        try:
+            rel_path = file_path.relative_to(assets_dir)
+        except ValueError:
+            continue
+
+        if rel_path in processed_files:
+            continue
+
+        scale_res = scale_texture_image(file_path, settings.scaler_modifier)
+        if scale_res:
+            w, h = scale_res
+            rng = get_deterministic_rng(rel_path.as_posix())
+            process_single_image_noise(file_path, rng, w, h, settings.strength, columns=1)
+
+        processed_files.add(rel_path)
+
+    logger.info("Texture scaling and noise generation pass complete.")
 
 
 def enforce_max_log_count(dir_path: Path, max_count: int, script_name: str) -> None:
